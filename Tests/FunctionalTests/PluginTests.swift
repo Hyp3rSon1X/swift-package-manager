@@ -1153,6 +1153,211 @@ struct PluginTests {
         }
     }
 
+    /// Creates a package with one command plugin built from `pluginSource`, invokes the plugin
+    /// `times` times through `DefaultPluginScriptRunner`, and returns each invocation's outcome
+    /// and the free-form output the plugin emitted. Errors before the first invocation (loading
+    /// the package graph) are thrown.
+    private func invokeCommandPlugin(
+        source pluginSource: String,
+        times: Int,
+        in tmpPath: AbsolutePath
+    ) async throws -> (results: [Result<Bool, any Error>], output: String) {
+        let packageDir = tmpPath.appending(components: "MyPackage")
+        try localFileSystem.createDirectory(packageDir, recursive: true)
+        try localFileSystem.writeFileContents(
+            packageDir.appending(components: "Package.swift"),
+            string: """
+            // swift-tools-version: 5.6
+            import PackageDescription
+            let package = Package(
+                name: "MyPackage",
+                targets: [
+                    .plugin(
+                        name: "ShortLivedPlugin",
+                        capability: .command(
+                            intent: .custom(verb: "short-lived-plugin", description: "Help description")
+                        )
+                    ),
+                ]
+            )
+            """
+        )
+        let pluginTargetDir = packageDir.appending(components: "Plugins", "ShortLivedPlugin")
+        try localFileSystem.createDirectory(pluginTargetDir, recursive: true)
+        try localFileSystem.writeFileContents(pluginTargetDir.appending("plugin.swift"), string: pluginSource)
+
+        // Load the package graph.
+        let observability = ObservabilitySystem.makeForTesting()
+        let workspace = try Workspace(
+            fileSystem: localFileSystem,
+            forRootPackage: packageDir,
+            customManifestLoader: ManifestLoader(toolchain: UserToolchain.default),
+            delegate: MockWorkspaceDelegate()
+        )
+        let rootInput = PackageGraphRootInput(packages: [packageDir], dependencies: [])
+        let packageGraph = try await workspace.loadPackageGraph(
+            rootInput: rootInput,
+            observabilityScope: observability.topScope
+        )
+        expectNoDiagnostics(observability.diagnostics)
+        let package: ResolvedPackage = try #require(packageGraph.rootPackages.first)
+        let plugin = try #require(
+            package.modules.compactMap { $0.underlying as? PluginModule }.first
+        )
+
+        final class PluginDelegate: PluginInvocationDelegate, @unchecked Sendable {
+            var output = Data()
+            func pluginCompilationStarted(commandLine: [String], environment: [String: String]) {}
+            func pluginCompilationEnded(result: PluginCompilationResult) {}
+            func pluginCompilationWasSkipped(cachedResult: PluginCompilationResult) {}
+            func pluginEmittedOutput(_ data: Data) { output.append(data) }
+            func pluginEmittedDiagnostic(_ diagnostic: Basics.Diagnostic) {}
+            func pluginEmittedProgress(_ message: String) {}
+        }
+
+        // Run the plugin to completion.
+        let delegateQueue = DispatchQueue(label: "plugin-invocation")
+        let delegate = PluginDelegate()
+        let pluginDir = tmpPath.appending(components: package.identity.description, plugin.name)
+        let scriptRunner = DefaultPluginScriptRunner(
+            fileSystem: localFileSystem,
+            cacheDir: pluginDir.appending("cache"),
+            toolchain: try UserToolchain.default
+        )
+        var results: [Result<Bool, any Error>] = []
+        for _ in 0..<times {
+            do {
+                results.append(.success(try await plugin.invoke(
+                    action: .performCommand(package: package, arguments: []),
+                    buildEnvironment: BuildEnvironment(platform: .macOS, configuration: .debug),
+                    workers: 1,
+                    scriptRunner: scriptRunner,
+                    workingDirectory: package.path,
+                    outputDirectory: pluginDir.appending("output"),
+                    toolSearchDirectories: [try UserToolchain.default.swiftCompilerPath.parentDirectory],
+                    accessibleTools: [:],
+                    writableDirectories: [pluginDir.appending("output")],
+                    readOnlyDirectories: [package.path],
+                    allowNetworkConnections: [],
+                    pkgConfigDirectories: [],
+                    sdkRootPath: try UserToolchain.default.sdkRootPath,
+                    fileSystem: localFileSystem,
+                    modulesGraph: packageGraph,
+                    observabilityScope: observability.topScope,
+                    callbackQueue: delegateQueue,
+                    delegate: delegate
+                )))
+            } catch {
+                results.append(.failure(error))
+            }
+        }
+        let output = delegateQueue.sync { String(decoding: delegate.output, as: UTF8.self) }
+        return (results, output)
+    }
+
+#if !os(Windows) // The C runtime on Windows has no `clock_gettime` and no `CLOCK_PROCESS_CPUTIME_ID`.
+    /// Returns the CPU time this process used in the quietest of four 0.5 s windows.
+    private func quietestCPUTimeOverHalfSecondWindows() async throws -> Double {
+        func processCPUTime() -> Double {
+            var time = timespec()
+            clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time)
+            return Double(time.tv_sec) + Double(time.tv_nsec) / 1e9
+        }
+        // Taking the quietest window tolerates unrelated work elsewhere in this process.
+        var quietest = Double.infinity
+        for _ in 0..<4 {
+            let start = processCPUTime()
+            try await Task.sleep(nanoseconds: 500_000_000)
+            quietest = min(quietest, processCPUTime() - start)
+        }
+        return quietest
+    }
+
+    @Test(.requiresSwiftConcurrencySupport)
+    func testPluginOutputIsNotReadAfterEndOfFile() async throws {
+        // A read source on a pipe whose writer has closed keeps firing until it is cancelled
+        // (EV_EOF with kqueue; EPOLLHUP with libdispatch's epoll backend once it reports hang-ups
+        // like kqueue does). If the plugin runner kept a readability handler installed after the
+        // plugin exited, this process would keep a CPU busy for as long as it lives.
+        try await testWithTemporaryDirectory { (tmpPath: AbsolutePath) -> Void in
+            let (results, output) = try await invokeCommandPlugin(
+                source: """
+                    import PackagePlugin
+                    import Foundation
+                    @main struct ShortLivedPlugin: CommandPlugin {
+                        func performCommand(
+                            context: PluginContext,
+                            arguments: [String]
+                        ) throws {
+                            print("hello from the plugin")
+                            FileHandle.standardError.write(Data("bye from the plugin\\n".utf8))
+                        }
+                    }
+                    """,
+                times: 4,
+                in: tmpPath
+            )
+            #expect(results.map { try? $0.get() } == [true, true, true, true], "\(results)")
+            #expect(output.contains("hello from the plugin"), "\(output)")
+            #expect(output.contains("bye from the plugin"), "\(output)")
+
+            // Every plugin has exited and its pipes are at end-of-file, so this process should be
+            // idle. Four invocations leave four handlers on either pipe if they are not removed,
+            // which keeps well over half a CPU busy.
+            let quietest = try await quietestCPUTimeOverHalfSecondWindows()
+            #expect(quietest < 0.25, "process used \(quietest) s of CPU in an idle 0.5 s window after the plugins exited")
+        }
+    }
+
+#endif
+
+    @Test(
+        .requiresSwiftConcurrencySupport,
+        .disabled(if: ProcessInfo.hostOperatingSystem == .windows, "Not verified on Windows")
+    )
+    func testPluginOutputIsDrainedAfterInvalidMessage() async throws {
+        // A plugin whose output cannot be split into messages (here a header with an invalid
+        // length) must still be read to the end: if the runner stopped reading, a plugin that
+        // writes more than a pipe buffer would block forever and so would the invocation.
+        try await testWithTemporaryDirectory { (tmpPath: AbsolutePath) -> Void in
+            let finished = ThreadSafeBox(false)
+            let invocation = Task {
+                defer { finished.put(true) }
+                // The plugin bypasses PackagePlugin's message channel and writes straight to the
+                // host's pipe, so the invocation itself fails; only that it ends matters here.
+                return try await invokeCommandPlugin(
+                    source: """
+                        import Foundation
+                        @main struct GarbagePlugin {
+                            static func main() {
+                                // Wait for the host's first message, so it is not written to a
+                                // closed pipe after this process has exited.
+                                _ = FileHandle.standardInput.readData(ofLength: 8)
+                                FileHandle.standardError.write(Data("garbage plugin started\\n".utf8))
+                                let header = Data(count: 8) // a message length of 0 is invalid
+                                let rest = Data(repeating: 0x2A, count: 1 << 20)
+                                FileHandle.standardOutput.write(header + rest)
+                            }
+                        }
+                        """,
+                    times: 1,
+                    in: tmpPath
+                )
+            }
+            // Compiling the plugin takes part of this budget.
+            let deadline = ContinuousClock.now + .seconds(300)
+            while !finished.get() && ContinuousClock.now < deadline {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            }
+            #expect(finished.get(), "the plugin invocation did not finish: its output pipe is no longer read")
+            guard finished.get() else { return }
+            // Errors loading the package graph fail the test here. The marker shows that the
+            // plugin compiled and ran, rather than the invocation ending on a compile error.
+            let (results, output) = try await invocation.value
+            #expect(output.contains("garbage plugin started"), "the plugin did not run: \(results) \(output)")
+        }
+    }
+
     @Test
     func testUnusedPluginProductWarnings() async throws {
         // Test the warnings we get around unused plugin products in package dependencies.

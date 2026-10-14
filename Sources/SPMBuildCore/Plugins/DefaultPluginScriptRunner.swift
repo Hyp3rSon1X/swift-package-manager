@@ -528,8 +528,17 @@ public struct DefaultPluginScriptRunner: PluginScriptRunner, Cancellable {
                 }
                 catch {
                     print("error while trying to read message from plugin: \(error.interpolationDescription)")
+                    // The rest of the output can no longer be split into messages (after an
+                    // invalid header, for example). Discard it up to end-of-file, so a plugin that
+                    // keeps writing cannot block on a full pipe.
+                    _ = try? fileHandle.readToEnd()
                 }
             }
+            // Nothing more will come from the pipe: `readPluginMessage()` only returns nil at
+            // end-of-file, and after an error the rest was read to end-of-file above. Stop
+            // monitoring it: a read source on a pipe whose writer has closed keeps firing until
+            // it is cancelled, so leaving the handler installed would call it in a tight loop.
+            fileHandle.readabilityHandler = nil
         }
         process.standardOutput = stdoutPipe
 
@@ -546,7 +555,15 @@ public struct DefaultPluginScriptRunner: PluginScriptRunner, Cancellable {
         stderrPipe.fileHandleForReading.readabilityHandler = { fileHandle in
             // Read and pass on any available free-form text output from the plugin.
             // We need the lock since we could run concurrently with the termination handler.
-            stderrLock.withLock { stderrHandler(fileHandle.availableData) }
+            let data = stderrLock.withLock {
+                let data = fileHandle.availableData
+                stderrHandler(data)
+                return data
+            }
+            // Empty data means end-of-file. Stop monitoring the pipe, as for stdout above.
+            if data.isEmpty {
+                fileHandle.readabilityHandler = nil
+            }
         }
         process.standardError = stderrPipe
 
